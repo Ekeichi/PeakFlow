@@ -5,6 +5,8 @@ import numpy as np
 from collections import defaultdict
 import random
 import json
+from queue import PriorityQueue
+from typing import Tuple, Dict, Set
 
 class TrainingType(Enum):
     """ Type d'entrainement possible par l'environement """
@@ -48,6 +50,28 @@ class TrainingZones:
             z4=(int(fc_max * 0.8), int(fc_max * 0.9)),
             z5=(int(fc_max * 0.9), int(fc_max))
         )
+
+class ModelPriorityQueue:
+    def __init__(self, theta: float = 0.0001):
+        self.pq = PriorityQueue()
+        self.theta = theta
+        self.seen_items = set()  # Pour éviter les doublons
+    
+    def push(self, priority: float, state_action: Tuple):
+        if priority > self.theta and state_action not in self.seen_items:
+            # Priorité négative car PriorityQueue est min heap
+            self.pq.put((-priority, state_action))
+            self.seen_items.add(state_action)
+    
+    def pop(self) -> Tuple[float, Tuple]:
+        if not self.pq.empty():
+            priority, state_action = self.pq.get()
+            self.seen_items.remove(state_action)
+            return -priority, state_action
+        return None
+    
+    def empty(self) -> bool:
+        return self.pq.empty()
 
 class MarathonTrainingState:
     def __init__(self):
@@ -197,16 +221,16 @@ class MarathonEnvironment:
             TrainingType.COTES: 1.1,    # Réduit de 1.2 à 1.1
             TrainingType.LONG: 1.3,     # Augmenté de 1.1 à 1.3
             TrainingType.ENDURANCE: 1.2, # Nouveau facteur
-            TrainingType.CROSS_VELO: 0.8,
-            TrainingType.CROSS_NATATION: 0.7,
+            TrainingType.CROSS_VELO: 0.9,
+            TrainingType.CROSS_NATATION: 0.8,
             TrainingType.FORCE: 0.6
         }
         if action.type in type_factors:
             effort *= type_factors[action.type]
         
         # Normalisation
-        # Une séance maximale serait : 120 minutes en zone 5 (exp(5) ≈ 148)
-        max_possible_effort = (120/60) * np.exp(5) * 1.2  # 1.2 est le facteur max
+        # Une séance maximale serait : 120 minutes en zone 4 (exp(4) ≈ 55)
+        max_possible_effort = (120/60) * np.exp(4) * 1.3  # 1.3 est le facteur max
         
         # Normaliser entre 0 et 1
         normalized_effort = effort / max_possible_effort
@@ -280,6 +304,9 @@ class AdvancedDynaQMarathon:
         self.lr = learning_rate
         self.gamma = discount_factor
         self.epsilon = epsilon
+
+        self.pq = ModelPriorityQueue()
+        self.predecessors = defaultdict(set)
         
         # Générer l'espace d'actions
         self.actions = self._generate_action_space()
@@ -335,26 +362,29 @@ class AdvancedDynaQMarathon:
         return max(self.actions, 
                   key=lambda a: self.Q[state_key][a.discretize()])
     
-    def learn(self, 
-              state: MarathonTrainingState,
-              action: TrainingAction,
-              reward: float,
-              next_state: MarathonTrainingState):
-        """Met à jour la fonction Q et le modèle, puis effectue la planification"""
+    def learn(self, state, action, reward, next_state):
         state_key = state.discretize()
         action_key = action.discretize()
         next_state_key = next_state.discretize()
         
-        # Mise à jour Q-learning directe
+        # Calcul de l'erreur de priorité
+        old_value = self.Q[state_key][action_key]
         best_next_value = max([self.Q[next_state_key][a.discretize()] 
-                             for a in self.actions])
+                            for a in self.actions])
+        new_value = reward + self.gamma * best_next_value
+        priority = abs(new_value - old_value)
         
-        td_target = reward + self.gamma * best_next_value
-        current_q = self.Q[state_key][action_key]
-        self.Q[state_key][action_key] = current_q + self.lr * (td_target - current_q)
+        # Mise à jour standard
+        self.Q[state_key][action_key] = old_value + self.lr * (new_value - old_value)
         
         # Mise à jour du modèle
         self.model[(state_key, action_key)] = (reward, next_state_key)
+        
+        # Mise à jour des prédécesseurs
+        self.predecessors[next_state_key].add((state_key, action_key))
+        
+        # Ajouter à la file de priorité
+        self.pq.push(priority, (state_key, action_key))
         
         # Planification
         self.plan()
@@ -364,22 +394,36 @@ class AdvancedDynaQMarathon:
         self.rewards_history.append(reward)
     
     def plan(self):
-        """Effectue n_planning_steps mises à jour en utilisant le modèle"""
+        """Planification avec Prioritized Sweeping"""
         if not self.model:
             return
             
         for _ in range(self.n_planning_steps):
-            # Choisir une expérience aléatoire du modèle
-            state_action = random.choice(list(self.model.keys()))
-            reward, next_state_key = self.model[state_action]
-            state_key, action_key = state_action
+            if self.pq.empty():
+                break
+                
+            result = self.pq.pop()
+            if result is None:
+                break
+                
+            priority, (state_key, action_key) = result
+            reward, next_state_key = self.model[(state_key, action_key)]
             
-            # Mise à jour Q basée sur le modèle
+            # Mise à jour Q
             best_next_value = max([self.Q[next_state_key][a.discretize()] 
-                                 for a in self.actions])
-            td_target = reward + self.gamma * best_next_value
-            current_q = self.Q[state_key][action_key]
-            self.Q[state_key][action_key] = current_q + self.lr * (td_target - current_q)
+                                for a in self.actions])
+            value = reward + self.gamma * best_next_value
+            self.Q[state_key][action_key] += self.lr * (value - self.Q[state_key][action_key])
+            
+            # Mise à jour des prédécesseurs
+            for prev_state_key, prev_action_key in self.predecessors[state_key]:
+                if (prev_state_key, prev_action_key) in self.model:
+                    prev_reward, _ = self.model[(prev_state_key, prev_action_key)]
+                    prev_value = self.Q[prev_state_key][prev_action_key]
+                    new_value = prev_reward + self.gamma * max([self.Q[state_key][a.discretize()] 
+                                                            for a in self.actions])
+                    priority = abs(new_value - prev_value)
+                    self.pq.push(priority, (prev_state_key, prev_action_key))
 
     def get_training_recommendation(self, state: MarathonTrainingState) -> Dict:
         """Génère une recommandation d'entraînement détaillée"""
